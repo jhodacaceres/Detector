@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor de Gas y Temperatura</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #0e1116;
+    color: #e6edf3;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  header { text-align: center; margin-bottom: 32px; }
+
+  h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.3px; }
+
+  #conexion {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #7d8590;
+  }
+
+  #conexion.ok   { color: #3fb950; }
+  #conexion.fail { color: #f85149; }
+
+  .tarjetas {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 20px;
+    width: 100%;
+    max-width: 720px;
+  }
+
+  .tarjeta {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 14px;
+    padding: 28px;
+    text-align: center;
+    transition: border-color .3s, background .3s;
+  }
+
+  .etiqueta {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: #7d8590;
+    margin-bottom: 12px;
+  }
+
+  .valor {
+    font-size: 56px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+
+  .unidad { font-size: 22px; color: #7d8590; font-weight: 400; }
+
+  .estado {
+    margin-top: 16px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 999px;
+    display: inline-block;
+    background: #1f2d22;
+    color: #3fb950;
+  }
+
+  /* Estado de alarma */
+  .tarjeta.alarma {
+    border-color: #f85149;
+    background: #20100f;
+    animation: latido 1.2s ease-in-out infinite;
+  }
+
+  .tarjeta.alarma .valor  { color: #ff7b72; }
+  .tarjeta.alarma .estado { background: #3d1513; color: #ff7b72; }
+
+  @keyframes latido {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(248,81,73,.35); }
+    50%      { box-shadow: 0 0 0 10px rgba(248,81,73,0); }
+  }
+
+  footer {
+    margin-top: 28px;
+    font-size: 12px;
+    color: #484f58;
+  }
+</style>
+</head>
+<body>
+
+  <header>
+    <h1>Monitor de Gas y Temperatura</h1>
+    <div id="conexion">Conectando...</div>
+  </header>
+
+  <div class="tarjetas">
+
+    <div class="tarjeta" id="tarjetaTemp">
+      <div class="etiqueta">Temperatura</div>
+      <div class="valor"><span id="temp">--</span><span class="unidad">&nbsp;&deg;C</span></div>
+      <div class="estado" id="estadoTemp">Normal</div>
+    </div>
+
+    <div class="tarjeta" id="tarjetaGas">
+      <div class="etiqueta">Gas &mdash; Rs/R0</div>
+      <div class="valor"><span id="ratio">--</span></div>
+      <div class="estado" id="estadoGas">Sin gas</div>
+    </div>
+
+  </div>
+
+  <footer id="actualizado">Esperando datos del ESP32</footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
