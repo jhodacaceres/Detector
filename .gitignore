@@ -1,0 +1,13 @@
+# Variables de entorno (keys, PIN, conexión a la base)
+.env
+.env*.local
+.env.local
+
+# Credenciales del ESP32
+ESP32/detector/secrets.h
+
+# Respaldos de la base (contienen datos)
+respaldos/
+
+# Vercel CLI
+.vercel

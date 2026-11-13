@@ -1,0 +1,32 @@
+# Mantiene activo el proyecto de Supabase (el plan gratuito lo pausa tras 7 días sin actividad).
+# Cada 3 días llama a /api/estado de la web en Vercel, que consulta la base.
+#
+# Configuración (una sola vez): GitHub -> Settings -> Secrets and variables -> Actions
+#   -> pestaña "Variables" -> New repository variable
+#   Nombre: URL_APP   Valor: https://TU-APP.vercel.app   (sin barra final)
+#
+# Nota: GitHub desactiva los workflows programados si el repositorio pasa 60 días
+# sin actividad. Ver PLAN_CONTINGENCIAS.md -> "Supabase pausado".
+name: Keepalive Supabase
+
+on:
+  schedule:
+    - cron: "0 12 */3 * *"   # 12:00 UTC cada 3 días
+  workflow_dispatch:           # ejecución manual desde la pestaña Actions
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Consultar /api/estado
+        env:
+          URL_APP: ${{ vars.URL_APP }}
+        run: |
+          if [ -z "$URL_APP" ]; then
+            echo "Falta la variable de repositorio URL_APP"
+            exit 1
+          fi
+          codigo=$(curl -s -o respuesta.json -w '%{http_code}' --max-time 30 "$URL_APP/api/estado")
+          echo "HTTP $codigo"
+          head -c 300 respuesta.json; echo
+          test "$codigo" = "200"

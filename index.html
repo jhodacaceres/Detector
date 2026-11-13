@@ -15,36 +15,44 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
-    padding: 24px;
+    padding: 32px 16px;
   }
 
-  header { text-align: center; margin-bottom: 32px; }
-
+  header { text-align: center; margin-bottom: 20px; }
   h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.3px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px; color: #7d8590; margin-bottom: 12px; font-weight: 600; }
 
-  #conexion {
-    margin-top: 8px;
-    font-size: 13px;
-    color: #7d8590;
-  }
-
+  #conexion { margin-top: 8px; font-size: 13px; color: #7d8590; }
   #conexion.ok   { color: #3fb950; }
   #conexion.fail { color: #f85149; }
 
+  .contenedor { width: 100%; max-width: 760px; display: flex; flex-direction: column; gap: 20px; }
+
+  /* Franja de estado del sistema */
+  #franja {
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: center;
+    background: #1f2d22;
+    color: #3fb950;
+    border: 1px solid #238636;
+  }
+  #franja.aviso { background: #2d2513; color: #e3b341; border-color: #9e6a03; }
+  #franja.grave { background: #3d1513; color: #ff7b72; border-color: #f85149; }
+
   .tarjetas {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 20px;
-    width: 100%;
-    max-width: 720px;
   }
 
   .tarjeta {
     background: #161b22;
     border: 1px solid #30363d;
     border-radius: 14px;
-    padding: 28px;
+    padding: 24px;
     text-align: center;
     transition: border-color .3s, background .3s;
   }
@@ -58,17 +66,17 @@
   }
 
   .valor {
-    font-size: 56px;
+    font-size: 48px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     line-height: 1;
   }
 
-  .unidad { font-size: 22px; color: #7d8590; font-weight: 400; }
+  .unidad { font-size: 20px; color: #7d8590; font-weight: 400; }
 
   .estado {
     margin-top: 16px;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     padding: 6px 14px;
     border-radius: 999px;
@@ -77,26 +85,66 @@
     color: #3fb950;
   }
 
-  /* Estado de alarma */
   .tarjeta.alarma {
     border-color: #f85149;
     background: #20100f;
     animation: latido 1.2s ease-in-out infinite;
   }
-
   .tarjeta.alarma .valor  { color: #ff7b72; }
   .tarjeta.alarma .estado { background: #3d1513; color: #ff7b72; }
+
+  .tarjeta.aviso { border-color: #9e6a03; }
+  .tarjeta.aviso .estado { background: #2d2513; color: #e3b341; }
 
   @keyframes latido {
     0%, 100% { box-shadow: 0 0 0 0 rgba(248,81,73,.35); }
     50%      { box-shadow: 0 0 0 10px rgba(248,81,73,0); }
   }
 
-  footer {
-    margin-top: 28px;
-    font-size: 12px;
-    color: #484f58;
+  /* Barra de agua */
+  .barra { height: 10px; background: #21262d; border-radius: 999px; overflow: hidden; margin-top: 14px; }
+  .barra > div { height: 100%; width: 0%; background: #2f81f7; transition: width .4s; }
+  .detalle { font-size: 12px; color: #7d8590; margin-top: 8px; }
+
+  /* Paneles */
+  .panel {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 14px;
+    padding: 20px;
   }
+
+  #listaAlertas { list-style: none; font-size: 14px; }
+  #listaAlertas li { padding: 8px 0; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; gap: 12px; }
+  #listaAlertas li:last-child { border-bottom: none; }
+  #listaAlertas .hora { color: #7d8590; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  .fila { display: flex; gap: 10px; flex-wrap: wrap; }
+  input[type=password] {
+    flex: 1 1 180px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #e6edf3;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+  button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #mensajeComando { font-size: 13px; margin-top: 10px; color: #7d8590; min-height: 1em; }
+  #mensajeComando.ok   { color: #3fb950; }
+  #mensajeComando.fail { color: #f85149; }
+
+  footer { margin-top: 24px; font-size: 12px; color: #484f58; text-align: center; }
 </style>
 </head>
 <body>
@@ -106,21 +154,47 @@
     <div id="conexion">Conectando...</div>
   </header>
 
-  <div class="tarjetas">
+  <main class="contenedor">
 
-    <div class="tarjeta" id="tarjetaTemp">
-      <div class="etiqueta">Temperatura</div>
-      <div class="valor"><span id="temp">--</span><span class="unidad">&nbsp;&deg;C</span></div>
-      <div class="estado" id="estadoTemp">Normal</div>
+    <div id="franja">Esperando datos del ESP32</div>
+
+    <div class="tarjetas">
+      <div class="tarjeta" id="tarjetaTemp">
+        <div class="etiqueta">Temperatura</div>
+        <div class="valor"><span id="temp">--</span><span class="unidad">&nbsp;&deg;C</span></div>
+        <div class="estado" id="estadoTemp">Normal</div>
+      </div>
+
+      <div class="tarjeta" id="tarjetaGas">
+        <div class="etiqueta">Gas &mdash; MQ-7</div>
+        <div class="valor"><span id="gas">--</span><span class="unidad">&nbsp;V</span></div>
+        <div class="estado" id="estadoGas">Sin gas</div>
+      </div>
+
+      <div class="tarjeta" id="tarjetaAgua">
+        <div class="etiqueta">Agua del dep&oacute;sito</div>
+        <div class="valor"><span id="agua">--</span><span class="unidad">&nbsp;ml</span></div>
+        <div class="barra"><div id="barraAgua"></div></div>
+        <div class="detalle" id="detalleAgua">&nbsp;</div>
+        <div class="estado" id="estadoBombas">Bombas apagadas</div>
+      </div>
     </div>
 
-    <div class="tarjeta" id="tarjetaGas">
-      <div class="etiqueta">Gas &mdash; Rs/R0</div>
-      <div class="valor"><span id="ratio">--</span></div>
-      <div class="estado" id="estadoGas">Sin gas</div>
-    </div>
+    <section class="panel">
+      <h2>&Uacute;ltimas alertas</h2>
+      <ul id="listaAlertas"><li>Sin alertas registradas</li></ul>
+    </section>
 
-  </div>
+    <section class="panel">
+      <h2>Reiniciar ESP32 (dep&oacute;sito recargado)</h2>
+      <div class="fila">
+        <input type="password" id="pin" placeholder="PIN de administraci&oacute;n" autocomplete="current-password">
+        <button id="botonReiniciar" type="button">Reiniciar</button>
+      </div>
+      <div id="mensajeComando"></div>
+    </section>
+
+  </main>
 
   <footer id="actualizado">Esperando datos del ESP32</footer>
 
