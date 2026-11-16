@@ -101,10 +101,6 @@
     50%      { box-shadow: 0 0 0 10px rgba(248,81,73,0); }
   }
 
-  /* Barra de agua */
-  .barra { height: 10px; background: #21262d; border-radius: 999px; overflow: hidden; margin-top: 14px; }
-  .barra > div { height: 100%; width: 0%; background: #2f81f7; transition: width .4s; }
-  .detalle { font-size: 12px; color: #7d8590; margin-top: 8px; }
 
   /* Paneles */
   .panel {
@@ -171,12 +167,10 @@
         <div class="estado" id="estadoGas">Sin gas</div>
       </div>
 
-      <div class="tarjeta" id="tarjetaAgua">
-        <div class="etiqueta">Agua del dep&oacute;sito</div>
-        <div class="valor"><span id="agua">--</span><span class="unidad">&nbsp;ml</span></div>
-        <div class="barra"><div id="barraAgua"></div></div>
-        <div class="detalle" id="detalleAgua">&nbsp;</div>
-        <div class="estado" id="estadoBombas">Bombas apagadas</div>
+      <div class="tarjeta" id="tarjetaBombas">
+        <div class="etiqueta">Bombas de agua</div>
+        <div class="valor"><span id="bombas">--</span></div>
+        <div class="estado" id="estadoBombas">En espera</div>
       </div>
     </div>
 
@@ -186,7 +180,7 @@
     </section>
 
     <section class="panel">
-      <h2>Reiniciar ESP32 (dep&oacute;sito recargado)</h2>
+      <h2>Reiniciar ESP32</h2>
       <div class="fila">
         <input type="password" id="pin" placeholder="PIN de administraci&oacute;n" autocomplete="current-password">
         <button id="botonReiniciar" type="button">Reiniciar</button>

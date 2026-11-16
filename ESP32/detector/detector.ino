@@ -5,6 +5,9 @@
 //  - La red corre en otra tarea (core 0) y nunca bloquea las alarmas (core 1).
 //  - Envía a Supabase por la RPC registrar_lectura (con token del dispositivo).
 //  - Revisa comandos remotos (botón "Reiniciar" de la web).
+//  - Valores EN VIVO cada 1 s por Supabase Realtime (WebSocket), solo mientras
+//    alguien mira la web (la web avisa "mirando" cada 10 s). No se guardan en la base.
+//    Requiere la librería "WebSockets" de Markus Sattler (Gestor de librerías).
 //
 //  Credenciales en secrets.h (copiar desde secrets.example.h).
 //  Documentación: contexto proyecto/CONTEXTO_PROYECTO.md y PLAN_CONTINGENCIAS.md
@@ -12,6 +15,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 #include <esp_arduino_version.h>
@@ -23,7 +27,7 @@ const int PIN_LM35   = 34;   // ADC1
 const int PIN_MQ7    = 35;   // ADC1
 const int PIN_BOMBA1 = 25;   // Relé IN1 (activo en LOW)
 const int PIN_BOMBA2 = 26;   // Relé IN2 (activo en LOW)
-const int PIN_BUZZER = 27;   // Transistor NPN (HIGH = suena)
+const int PIN_BUZZER = 32;   // Transistor NPN (HIGH = suena). Era el 27: ese pin se dañó (no baja a 0 V)
 
 // ---------------- Umbrales con histéresis ----------------
 const float TEMP_ON  = 45.0;   // °C: enciende bombas
@@ -62,6 +66,12 @@ const unsigned long LECTURA_MS          = 1000;   // lectura de sensores
 const unsigned long ENVIO_MS            = 5000;   // envío periódico
 const unsigned long COMANDO_MS          = 5000;   // revisión de comandos remotos
 const unsigned long REINTENTO_WIFI_MS   = 30000;  // forzar reconexión si no conecta
+const unsigned long RED_TRABADA_MS      = 60000;  // tarea de red sin "señal de vida": forzar reconexión
+const unsigned long RED_REINICIO_MS     = 180000; // sigue trabada: reiniciar el ESP32
+const unsigned long RED_REPORTE_MS      = 60000;  // mensaje de estado de la red en el Monitor Serie
+const unsigned long VIVO_MS             = 1000;   // valores en vivo mientras alguien mira la web
+const unsigned long VIVO_ESPECTADOR_MS  = 30000;  // sin aviso "mirando" en 30 s: se deja de transmitir
+const unsigned long VIVO_HEARTBEAT_MS   = 25000;  // latido del canal Realtime (si no, el servidor lo cierra)
 const uint32_t      WDT_TIMEOUT_S       = 10;     // watchdog
 const int           MAX_EVENTOS         = 50;     // buffer de eventos sin red
 
@@ -71,7 +81,7 @@ struct Lectura {
   float  gas_v;
   bool   calor, gas, falla, sin_agua, precalentando;
   float  agua_ml;
-  time_t epoch;   // 0 si todavía no hay hora NTP
+  unsigned long creadoMs;   // millis() al tomar la lectura (para saber su antigüedad)
 };
 
 // ---------------- Estado (solo lo toca el loop, core 1) ----------------
@@ -82,7 +92,13 @@ float aguaMl = CAPACIDAD_ML;
 bool  prevCalor = false, prevGas = false, prevFalla = false, prevSinAgua = false;
 unsigned long ultimaLectura = 0, ultimoEnvio = 0, ultimoTickAgua = 0;
 
+// Compartido entre tareas (escrito por la red, leído por el loop)
+volatile unsigned long latidoRed     = 0;   // "señal de vida": la tarea de red no está trabada
+volatile unsigned long ultimoEnvioOk = 0;   // último dato guardado con éxito (0 = ninguno)
+volatile unsigned long latidoVivo    = 0;   // "señal de vida" de la tarea en vivo
+
 QueueHandle_t colaUltima;    // última lectura periódica (largo 1)
+QueueHandle_t colaVivo;      // lectura más reciente para el canal en vivo (largo 1)
 QueueHandle_t colaEventos;   // cambios de estado pendientes de envío
 
 // ============================================================
@@ -157,8 +173,7 @@ Lectura armarLectura() {
   l.sin_agua = sinAgua;
   l.precalentando = precalentando;
   l.agua_ml = aguaMl;
-  time_t t = time(nullptr);
-  l.epoch = (t > 1700000000) ? t : 0;
+  l.creadoMs = millis();
   return l;
 }
 
@@ -223,6 +238,9 @@ void cicloSensores(unsigned long ahora) {
   aplicarBombas(calor && !sinAgua);
   revisarCambios();
 
+  Lectura vivo = armarLectura();
+  xQueueOverwrite(colaVivo, &vivo);   // siempre la más reciente; la tarea en vivo decide si se envía
+
   if (ahora - ultimoEnvio >= ENVIO_MS) {
     ultimoEnvio = ahora;
     Lectura l = armarLectura();
@@ -246,7 +264,10 @@ const char* b(bool v) { return v ? "true" : "false"; }
 int llamarRPC(WiFiClientSecure& cliente, const char* funcion, const String& cuerpo, String* respuesta) {
   HTTPClient http;
   String url = String(SUPABASE_URL) + "/rest/v1/rpc/" + funcion;
-  if (!http.begin(cliente, url)) return -1;
+  // Conexión NUEVA en cada envío: reutilizar una conexión TLS que el servidor
+  // cerró por inactividad puede dejar el ESP32 esperando para siempre.
+  http.setReuse(false);
+  if (!http.begin(cliente, url)) { cliente.stop(); return -1; }
   http.setConnectTimeout(3000);
   http.setTimeout(3000);
   http.addHeader("Content-Type", "application/json");
@@ -262,6 +283,7 @@ int llamarRPC(WiFiClientSecure& cliente, const char* funcion, const String& cuer
     Serial.printf("[Supabase] %s -> error de conexión (%d)\n", funcion, codigo);
   }
   http.end();
+  cliente.stop();   // cerrar siempre: la próxima llamada abre una conexión limpia
   return codigo;
 }
 
@@ -280,10 +302,16 @@ bool enviarLectura(WiFiClientSecure& cliente, const Lectura& l) {
   json += ",\"p_caudal_ml_por_s\":" + String(CAUDAL_ML_POR_S, 2);
   json += ",\"p_reserva_ml\":"      + String(RESERVA_ML, 1);
   json += ",\"p_num_bombas\":"      + String(NUM_BOMBAS);
-  if (l.epoch > 0) {
+  // Hora: una lectura reciente usa la hora de Supabase (siempre exacta).
+  // Solo un evento que esperó sin red (más de 15 s) envía su hora, calculada
+  // con el reloj NTP del ESP32 menos su antigüedad.
+  unsigned long edadMs = millis() - l.creadoMs;
+  time_t ahoraEpoch = time(nullptr);
+  if (edadMs > 15000 && ahoraEpoch > 1700000000) {
+    time_t momento = ahoraEpoch - (time_t)(edadMs / 1000);
     char buf[25];
     struct tm t;
-    gmtime_r(&l.epoch, &t);
+    gmtime_r(&momento, &t);
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
     json += ",\"p_fecha\":\"" + String(buf) + "\"";
   }
@@ -319,8 +347,18 @@ void tareaRed(void* parametro) {
 
   bool ntpConfigurado = false;
   unsigned long espera = 0, inicioEspera = 0, ultimoComando = 0, ultimoIntentoWifi = millis();
+  unsigned long ultimoReporte = millis();
 
   for (;;) {
+    latidoRed = millis();   // si esto deja de actualizarse, el loop sabe que la red se trabó
+
+    // Reporte periódico: permite ver en el Monitor Serie que la red sigue viva
+    if (millis() - ultimoReporte >= RED_REPORTE_MS) {
+      ultimoReporte = millis();
+      if (ultimoEnvioOk == 0) Serial.println("[Red] Aún no se ha guardado ningún dato");
+      else Serial.printf("[Red] OK · último dato guardado hace %lu s\n", (millis() - ultimoEnvioOk) / 1000);
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
       if (millis() - ultimoIntentoWifi >= REINTENTO_WIFI_MS) {
         ultimoIntentoWifi = millis();
@@ -347,16 +385,19 @@ void tareaRed(void* parametro) {
 
     // 1. Eventos pendientes (incluye los guardados mientras no había red)
     while (ok && xQueueReceive(colaEventos, &l, 0) == pdTRUE) {
+      latidoRed = millis();
       ok = enviarLectura(cliente, l);
       if (!ok) xQueueSendToFront(colaEventos, &l, 0);
-      else vTaskDelay(pdMS_TO_TICKS(1100));   // la RPC acepta 1 envío por segundo
+      else { ultimoEnvioOk = millis(); vTaskDelay(pdMS_TO_TICKS(1100)); }   // la RPC acepta 1 envío por segundo
     }
 
     // 2. Última lectura periódica
+    latidoRed = millis();
     if (ok && xQueueReceive(colaUltima, &l, 0) == pdTRUE) {
       ok = enviarLectura(cliente, l);
-      if (ok) vTaskDelay(pdMS_TO_TICKS(1100));
+      if (ok) { ultimoEnvioOk = millis(); vTaskDelay(pdMS_TO_TICKS(1100)); }
     }
+    latidoRed = millis();
 
     // 3. Comandos remotos
     if (ok && millis() - ultimoComando >= COMANDO_MS) {
@@ -372,6 +413,132 @@ void tareaRed(void* parametro) {
       Serial.printf("[Red] Fallo de envío, reintento en %lu s\n", espera / 1000);
     }
     vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+// ============================================================
+//  En vivo: Supabase Realtime Broadcast (tarea en core 0)
+//  Protocolo Phoenix sobre WebSocket: unirse al canal, latido cada 25 s,
+//  escuchar "mirando" (web abierta) y enviar "lectura" cada 1 s.
+// ============================================================
+WebSocketsClient ws;
+const char* CANAL_VIVO = "realtime:detector";
+bool vivoUnido = false;                 // solo lo tocan la tarea en vivo y su callback (misma tarea)
+unsigned long ultimoEspectador = 0;
+unsigned long refVivo = 2;              // la referencia "1" es la del ingreso al canal
+
+void enviarPhoenix(const char* topico, const char* evento, const String& payload) {
+  String m = String("{\"topic\":\"") + topico + "\",\"event\":\"" + evento +
+             "\",\"payload\":" + payload + ",\"ref\":\"" + String(refVivo++) + "\",\"join_ref\":\"1\"}";
+  ws.sendTXT(m);
+}
+
+void alEventoVivo(WStype_t tipo, uint8_t* datos, size_t largo) {
+  if (tipo == WStype_CONNECTED) {
+    vivoUnido = false;
+    String unirse = String("{\"topic\":\"") + CANAL_VIVO + "\",\"event\":\"phx_join\",\"ref\":\"1\",\"join_ref\":\"1\","
+      "\"payload\":{\"config\":{\"broadcast\":{\"self\":false,\"ack\":false},\"presence\":{\"key\":\"\"},\"private\":false}}}";
+    ws.sendTXT(unirse);
+  } else if (tipo == WStype_DISCONNECTED) {
+    if (vivoUnido) Serial.println("[Vivo] Canal desconectado (se reintenta solo)");
+    vivoUnido = false;
+  } else if (tipo == WStype_TEXT) {
+    String m((const char*)datos, largo);
+    if (m.indexOf("\"phx_reply\"") >= 0 && m.indexOf("\"ref\":\"1\"") >= 0) {
+      vivoUnido = m.indexOf("\"status\":\"ok\"") >= 0;
+      Serial.println(vivoUnido ? "[Vivo] Canal en vivo listo" : "[Vivo] El canal rechazó el ingreso");
+    } else if (m.indexOf("\"broadcast\"") >= 0 && m.indexOf("mirando") >= 0) {
+      if (ultimoEspectador == 0 || millis() - ultimoEspectador >= VIVO_ESPECTADOR_MS)
+        Serial.println("[Vivo] Alguien mira la web: enviando cada 1 s");
+      ultimoEspectador = millis();
+    } else if (m.indexOf("\"phx_error\"") >= 0 || m.indexOf("\"phx_close\"") >= 0) {
+      vivoUnido = false;
+      ws.disconnect();   // la librería vuelve a conectar y se reingresa al canal
+    }
+  }
+}
+
+void tareaVivo(void* parametro) {
+  String url = SUPABASE_URL;
+  String host = url.substring(url.indexOf("//") + 2);
+  String ruta = String("/realtime/v1/websocket?apikey=") + SUPABASE_KEY + "&vsn=1.0.0";
+  bool iniciado = false, transmitiendo = false;
+  unsigned long ultimoVivo = 0, ultimoLatido = 0;
+
+  for (;;) {
+    latidoVivo = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      vivoUnido = false;
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    if (!iniciado) {
+      ws.beginSSL(host.c_str(), 443, ruta.c_str(), "", "");   // sin validar certificado (prototipo)
+      ws.onEvent(alEventoVivo);
+      ws.setReconnectInterval(5000);
+      iniciado = true;
+    }
+    ws.loop();
+    latidoVivo = millis();
+
+    unsigned long ahora = millis();
+    if (ws.isConnected() && ahora - ultimoLatido >= VIVO_HEARTBEAT_MS) {
+      ultimoLatido = ahora;
+      String latido = "{\"topic\":\"phoenix\",\"event\":\"heartbeat\",\"payload\":{},\"ref\":\"" + String(refVivo++) + "\"}";
+      ws.sendTXT(latido);
+    }
+
+    // Solo se transmite mientras alguien mira la web (cuida la cuota mensual de Realtime)
+    bool hayEspectador = ultimoEspectador != 0 && ahora - ultimoEspectador < VIVO_ESPECTADOR_MS;
+    if (transmitiendo && !hayEspectador) Serial.println("[Vivo] Nadie mira la web: transmisión en pausa");
+    transmitiendo = hayEspectador;
+
+    Lectura l;
+    if (vivoUnido && hayEspectador && ahora - ultimoVivo >= VIVO_MS &&
+        xQueuePeek(colaVivo, &l, 0) == pdTRUE) {
+      ultimoVivo = ahora;
+      String p = "{\"type\":\"broadcast\",\"event\":\"lectura\",\"payload\":{";
+      p += "\"t\":" + String(l.temp, 2);
+      p += ",\"g\":" + String(l.gas_v, 2);
+      p += ",\"calor\":" + String(b(l.calor));
+      p += ",\"gas\":" + String(b(l.gas));
+      p += ",\"falla\":" + String(b(l.falla));
+      p += ",\"sin_agua\":" + String(b(l.sin_agua));
+      p += ",\"precal\":" + String(b(l.precalentando));
+      p += "}}";
+      enviarPhoenix(CANAL_VIVO, "broadcast", p);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// Vigilante de la red: corre en el loop (core 1) porque una tarea trabada
+// no puede vigilarse a sí misma. Solo actúa si la tarea de red deja de dar
+// "señal de vida"; si Supabase falla, la tarea sigue viva reintentando y NO se reinicia nada.
+void vigilarRed(unsigned long ahora) {
+  static bool reconexionForzada = false;
+  // Se vigilan las dos tareas de red: la de envíos (base) y la de valores en vivo
+  unsigned long lr = latidoRed, lv = latidoVivo;
+  unsigned long sinRed  = (ahora > lr) ? ahora - lr : 0;
+  unsigned long sinVivo = (ahora > lv) ? ahora - lv : 0;
+  unsigned long sinLatido = max(sinRed, sinVivo);
+  const char* cual = (sinRed >= sinVivo) ? "de red" : "en vivo";
+
+  if (sinLatido >= RED_REINICIO_MS) {
+    Serial.printf("!! [Red] Tarea %s trabada hace %lu s: reiniciando el ESP32\n", cual, sinLatido / 1000);
+    delay(100);
+    ESP.restart();
+  }
+  if (sinLatido >= RED_TRABADA_MS && !reconexionForzada) {
+    // Cortar el WiFi hace que la conexión trabada falle y la tarea de red continúe
+    Serial.printf("!! [Red] Tarea %s trabada hace %lu s: forzando reconexión WiFi\n", cual, sinLatido / 1000);
+    reconexionForzada = true;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+  if (sinLatido < RED_TRABADA_MS && reconexionForzada) {
+    reconexionForzada = false;
+    Serial.println("[Red] Recuperada");
   }
 }
 
@@ -418,6 +585,7 @@ void setup() {
 
   colaUltima  = xQueueCreate(1, sizeof(Lectura));
   colaEventos = xQueueCreate(MAX_EVENTOS, sizeof(Lectura));
+  colaVivo    = xQueueCreate(1, sizeof(Lectura));
 
   iniciarWatchdog();
 
@@ -425,7 +593,10 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  latidoRed = millis();
   xTaskCreatePinnedToCore(tareaRed, "red", 12288, nullptr, 1, nullptr, 0);
+  latidoVivo = millis();
+  xTaskCreatePinnedToCore(tareaVivo, "vivo", 12288, nullptr, 1, nullptr, 0);
 
   aguaMl = CAPACIDAD_ML;   // al arrancar se asume el depósito recargado
   ultimoTickAgua = millis();
@@ -444,6 +615,7 @@ void loop() {
   unsigned long ahora = millis();
 
   controlAgua(ahora);
+  vigilarRed(ahora);
   if (ahora - ultimaLectura >= LECTURA_MS) {
     ultimaLectura = ahora;
     cicloSensores(ahora);

@@ -44,7 +44,7 @@ GitHub Actions (keepalive cada 3 días) ──▶ /api/estado ──▶ evita qu
 ```
 Detector/
 ├── index.html                 # Dashboard: temperatura, gas, agua/bombas, alertas, botón de reinicio
-├── app.js                     # Consulta /api/estado cada 2 s y envía /api/comando
+├── app.js                     # Valores en vivo (Realtime, 1 s) + /api/estado (2 s, o 5 s con el canal en vivo) y /api/comando
 ├── api/
 │   ├── _supabase.js           # Utilidades compartidas (no es un endpoint)
 │   ├── estado.js              # GET: última lectura y 5 alertas
@@ -83,8 +83,11 @@ Repositorio: GitHub `jhodacaceres/Detector`, rama `main`. Cada push a GitHub pub
 | Relé | Módulo de 2 canales **SRD-05VDC-SL-C**, VCC a 5 V, activo en LOW |
 | Bombas | 2 bombas de agua de 5 V conectadas a COM/NO de cada relé |
 | Depósito | **500 ml** como referencia mínima; en un caso real la capacidad la define el usuario |
-| Buzzer | Mediante transistor NPN y resistor de 1 kΩ en GPIO27 |
-| Fuente | 5 V (cable USB adaptado), con un riel de 5 V y GND común |
+| Buzzer | Mediante transistor NPN y resistor de 1 kΩ en GPIO32 |
+| Fuente | **Cargador de pared de 5 V** (cable USB adaptado) al riel de 5 V y GND común. El ESP32 además va por USB a la PC para el Monitor Serie. **Un puerto USB de PC no alcanza para las bombas** (entrega 500–900 mA): el ESP32 se reinicia al arrancarlas |
+| Capacitores (electrolíticos, puestos el 2026-11-14) | **470 µF** en los rieles junto a la entrada de la fuente (pico de arranque de las bombas) · **100 µF** junto a VCC/GND del relé · **100 µF** junto al buzzer · **47 µF** entre VCC y GND del LM35 (nunca en OUT). Pata larga (+) al riel de 5 V, franja (−) a GND |
+| Sin diodos flyback | **Decisión del proyecto: no se ponen** (no se dispone de ellos). Riesgo aceptado: los picos de las bombas pueden dañar pines del ESP32 o los contactos del relé. Los capacitores lo reducen. Si se consiguen, cualquier 1N4001–1N4007 sirve (en paralelo con cada bomba, franja al +) |
+| Pendiente | Cerámico **104 (100 nF)** entre OUT y GND del LM35 |
 
 ### Pines
 
@@ -94,9 +97,9 @@ Repositorio: GitHub `jhodacaceres/Detector`, rama `main`. Cada push a GitHub pub
 | 35 | MQ-7 AOUT | Analógico |
 | 25 | Relé IN1 → bomba 1 | **Encender:** `OUTPUT` + `LOW`. **Apagar:** `INPUT` (alta impedancia) |
 | 26 | Relé IN2 → bomba 2 | Igual que el GPIO25 |
-| 27 | Buzzer | `HIGH` = suena |
+| 32 | Buzzer | `HIGH` = suena. **El GPIO27 de esta placa está dañado** (no baja a 0 V, el buzzer sonaba siempre): no usarlo |
 
-La tabla completa de conexiones está en `ESP32/conexiones_esp32_gas.xlsx` (25 conexiones).
+La tabla completa de conexiones está en `ESP32/conexiones_esp32_gas.xlsx` (33 conexiones, incluidos los capacitores).
 
 **¿Por qué el relé se apaga con `INPUT`?** El módulo funciona a 5 V y el ESP32 entrega solo 3.3 V en HIGH, lo que a veces no alcanza para apagarlo. En alta impedancia no circula corriente y el relé se apaga con seguridad. Además, al arrancar los pines ya son entradas, así que las bombas empiezan apagadas. Si un módulo se encendiera con `INPUT`, se cambia `APAGAR_RELE_CON_INPUT = false`.
 
@@ -151,9 +154,22 @@ valor_mq7 = ((analogReadMilliVolts(35) * 3.3) / 4095.0) * FACTOR_DIVISOR_MQ7;   
 - **Envío:**
   - Cada 5 s, la última lectura (`xQueueOverwrite`).
   - En cada cambio de `calor`, `gas`, `falla` o `sin_agua`, un **evento** en un buffer de 50 que se conserva sin red y se envía al volver.
-- **Hora:** NTP (UTC−4). Los eventos se envían con su hora real (`p_fecha`).
+- **Hora:** las lecturas recientes (15 s o menos) usan la **hora de Supabase**. Solo los eventos que esperaron sin red envían `p_fecha`, calculada con el reloj NTP del ESP32 menos su antigüedad. Se observó que el reloj del ESP32 se desfasaba unos 54 s.
+- **Conexión nueva en cada envío** (`setReuse(false)` + `stop()`): reutilizar la conexión TLS provocó que la tarea de red se trabara (2026-11-13).
 - **Errores:** reintentos con espera creciente de 5 s a 60 s; reconexión forzada del WiFi cada 30 s; timeouts de HTTP de 3 s y de TLS de 5 s.
+- **Vigilante de la red** (en el `loop`, porque una tarea trabada no puede vigilarse a sí misma):
+  - La tarea de red actualiza una "señal de vida" (`latidoRed`).
+  - Si pasan 60 s sin señal, fuerza una reconexión WiFi; a los 180 s, reinicia el ESP32.
+  - Si Supabase falla, la tarea sigue viva reintentando y **no** se reinicia nada.
+  - Cada minuto el Monitor Serie muestra `[Red] OK · último dato guardado hace X s`.
 - **Watchdog** de 10 s en el `loop`. Al arrancar se imprime el motivo del reinicio: watchdog, brownout, comando remoto, etc.
+- **Valores en vivo cada 1 s** (tarea `tareaVivo`, core 0; librería **WebSockets 2.7.2** de Markus Sattler):
+  - Mantiene abierto un WebSocket con **Supabase Realtime** (canal `realtime:detector`, broadcast público, latido cada 25 s).
+  - La web envía `mirando` cada 10 s mientras la pestaña está visible. El ESP32 transmite `lectura` cada 1 s **solo si recibió `mirando` en los últimos 30 s**; si no, pausa.
+  - **No se guarda en la base**: el historial y las alertas siguen saliendo de los envíos cada 5 s.
+  - Motivo del diseño: el plan gratuito incluye 2 millones de mensajes Realtime al mes y cada broadcast cuenta 1 al enviarse más 1 por cada pantalla que lo recibe. Transmitir siempre (24 h) serían 2.6 millones al mes; así se gastan unos 2 mensajes por segundo **solo con la web abierta** (≈ 270 h de pantalla abierta al mes).
+  - El vigilante también controla su señal de vida (`latidoVivo`), con las mismas reglas de 60 s y 180 s.
+  - Monitor Serie: `[Vivo] Canal en vivo listo`, `[Vivo] Alguien mira la web: enviando cada 1 s`, `[Vivo] Nadie mira la web: transmisión en pausa`.
 - **Comandos remotos:** cada unos 5 s llama a `obtener_comando`. Si hay un `reiniciar` con menos de 2 minutos de antigüedad, lo confirma y ejecuta `ESP.restart()`.
 - `client.setInsecure()`: HTTPS sin validar el certificado (limitación conocida del prototipo).
 
@@ -228,9 +244,9 @@ alertas: para siempre (con su "foto" de valores)
 
 ## 7. Web (Vercel)
 
-- **Variables de entorno en Vercel:** `SUPABASE_URL`, `SUPABASE_SECRET_KEY` y `ADMIN_PIN` (8 caracteres o más). Las mismas van en `.env.local` para trabajar en local.
+- **Variables de entorno en Vercel:** `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `ADMIN_PIN` (8 caracteres o más) y `SUPABASE_PUBLISHABLE_KEY` (la misma key pública del ESP32; habilita los valores en vivo). Las mismas van en `.env.local` para trabajar en local.
 - `GET /api/estado`:
-  - Devuelve `{ ultimo, alertas[5], servidor }`.
+  - Devuelve `{ ultimo, alertas[5], servidor, vivo }`. `vivo` = `{ url, key publishable }` para el canal en vivo, o `null` si falta `SUPABASE_PUBLISHABLE_KEY` (la web funciona igual, solo con lo guardado). La secret key nunca sale del servidor.
   - Lo cachea la CDN durante 2 s.
   - Sin variables configuradas o si falla Supabase, responde `503`.
 - `POST /api/comando` con `{pin}`:
@@ -239,11 +255,13 @@ alertas: para siempre (con su "foto" de valores)
   - `200`: comando creado.
 - **Interfaz:**
   - Franja de estado. Prioridad: sin datos > sin agua > gas > falla > calor > precalentamiento > normal.
-  - Tarjetas de temperatura, gas y agua (barra, autonomía, estado de las bombas).
+  - Tarjetas de temperatura, gas y **bombas** (activas / en espera / bloqueadas). Desde el 2026-11-14 **no se muestra el agua**: no hay un depósito fijo.
+  - **En vivo:** los valores llegan cada 1 s por el canal Realtime (protocolo Phoenix escrito a mano en `app.js`, sin librerías). El pie dice "En vivo · hora". Si el canal no llega en 3 s, se vuelve a mostrar lo guardado ("Última lectura guardada").
   - Últimas alertas.
   - Botón de reinicio con PIN y confirmación.
-- `vercel.json`: CSP `default-src 'self'`, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`.
+- `vercel.json`: CSP `default-src 'self'` (más `connect-src wss://*.supabase.co` para el canal en vivo), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`.
 - **Limitación:** `/api/estado` es público. Cualquiera puede ver el estado actual, pero no el historial ni otras tablas.
+- **Limitación del canal en vivo:** es un canal público (los canales privados exigirían cambiar la base, que está congelada). Con la key publishable, alguien podría mostrar valores falsos **en la pantalla en vivo** (no en la base ni en las alertas) o enviar `mirando` falsos para gastar la cuota. Ver `PLAN_CONTINGENCIAS.md`, sección 8.
 
 ## 8. Operación
 

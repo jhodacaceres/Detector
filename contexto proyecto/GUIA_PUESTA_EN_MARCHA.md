@@ -52,6 +52,7 @@ Tiempo aproximado: 45–60 minutos.
 
 ## Paso 4: subir el firmware al ESP32
 
+0. **Una sola vez:** Arduino IDE → **Herramientas → Gestionar librerías** → busca **WebSockets** (de Markus Sattler) → **Instalar** (versión 2.7.2 o posterior). Sin ella no compila: la usan los valores en vivo.
 1. Arduino IDE → **Archivo → Abrir** → `ESP32/detector/detector.ino`.
    Arriba deben aparecer las pestañas `detector.ino`, `secrets.example.h` y `secrets.h`.
 2. **Herramientas → Placa → ESP32 Dev Module** y elige el puerto COM.
@@ -63,6 +64,7 @@ Tiempo aproximado: 45–60 minutos.
 - Cada segundo: `Temp: ... | Gas (V): ... | ... WiFi=ok`.
 - **No** aparecen líneas `[Supabase] ... HTTP 4xx`.
 - En Supabase → Table Editor → `registros` llegan filas nuevas cada unos 5 s, con `id_dispositivo = 1`.
+- `[Vivo] Canal en vivo listo`. Al abrir la web: `[Vivo] Alguien mira la web: enviando cada 1 s`.
 
 **Si algo falla:**
 
@@ -70,7 +72,7 @@ Tiempo aproximado: 45–60 minutos.
 |---|---|---|
 | `HTTP 401` / `42501` | Token incorrecto | Repetir el paso 3 |
 | `HTTP 404` | No se ejecutó la migración | Repetir el paso 2 |
-| `WiFi=sin conexión` siempre | Red de 5 GHz o contraseña mal escrita | Revisar `secrets.h` |
+| `WiFi=sin conexión` siempre | Red de 5 GHz o contraseña mal escrita | Cargar `ESP32/buscar_pin` y escribir `w`: muestra si se ve la red y el motivo exacto (15 = contraseña incorrecta) |
 | Error de compilación | — | Copia el error y pídeme ayuda |
 
 ---
@@ -103,6 +105,7 @@ Tiempo aproximado: 45–60 minutos.
    | `SUPABASE_URL` | `https://wvmvjwwggquhsvdabmng.supabase.co` |
    | `SUPABASE_SECRET_KEY` | la key `sb_secret_...` |
    | `ADMIN_PIN` | una frase de 8 caracteres o más (es el PIN del botón Reiniciar) |
+   | `SUPABASE_PUBLISHABLE_KEY` | la key `sb_publishable_...` (la misma de `secrets.h`; activa los valores en vivo) |
 
 3. Escribe los mismos valores en `.env.local`.
 

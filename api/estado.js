@@ -43,10 +43,14 @@ module.exports = async function handler(req, res) {
 
     // La CDN de Vercel sirve la misma respuesta 2 s: absorbe el tráfico de muchas pestañas
     res.setHeader("Cache-Control", "public, s-maxage=2, stale-while-revalidate=5");
+    // Canal en vivo (Realtime): la key PUBLISHABLE es pública por diseño (la misma del ESP32).
+    // La secret key nunca sale del servidor. Sin la variable, la web funciona solo con lo guardado.
+    const publica = process.env.SUPABASE_PUBLISHABLE_KEY;
     return res.status(200).json({
       ultimo: aplanar(registros[0]),
       alertas,
-      servidor: new Date().toISOString()
+      servidor: new Date().toISOString(),
+      vivo: publica ? { url: cfg.url, key: publica } : null
     });
   } catch (error) {
     console.error(error);

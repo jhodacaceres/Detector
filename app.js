@@ -1,12 +1,20 @@
 // ===== Monitor de Gas y Temperatura (v3) =====
-// La web NO habla con Supabase directamente: usa las funciones de Vercel
-//   GET  /api/estado   -> última lectura y últimas alertas
+// La web NO habla con la base directamente: usa las funciones de Vercel
+//   GET  /api/estado   -> última lectura guardada, últimas alertas y datos del canal en vivo
 //   POST /api/comando  -> ordena reiniciar el ESP32 (con PIN)
-// Así ninguna key queda expuesta en el navegador.
+// Valores EN VIVO (cada 1 s): canal Realtime de Supabase (WebSocket, solo lectura de
+// mensajes "broadcast"). La web avisa "mirando" cada 10 s y el ESP32 transmite solo
+// mientras alguien mira. Si el canal falla, se sigue mostrando lo guardado (cada 5 s).
 
-const INTERVALO = 2000;          // ms entre consultas
-const MAX_ANTIGUEDAD = 20000;    // ms: si el último dato es más viejo, el ESP32 no está enviando
+const INTERVALO = 2000;          // ms entre consultas a /api/estado sin canal en vivo
+const INTERVALO_CON_VIVO = 5000; // con el canal en vivo funcionando basta para las alertas
+const VIVO_VIGENTE = 3000;       // ms: un valor en vivo más viejo que esto ya no se considera "en vivo"
+const MIRANDO_MS = 10000;        // aviso "mirando" al ESP32
+const LATIDO_MS = 25000;         // latido del canal (si no, el servidor lo cierra)
+const MAX_ANTIGUEDAD = 30000;    // ms: si el último dato es más viejo, el ESP32 no está enviando
+                                 // (envío cada 5 s + conexión TLS nueva por envío + caché de 2 s)
 const ZONA = "America/La_Paz";
+const CANAL = "realtime:detector";
 
 const $ = (id) => document.getElementById(id);
 
@@ -19,6 +27,7 @@ const TEXTO_ALERTA = {
 
 let ultimoDato = null;   // se conserva si la consulta falla
 let consultando = false;
+let ultimoVivo = 0;      // Date.now() del último valor en vivo recibido
 
 
 async function leerDatos() {
@@ -29,21 +38,27 @@ async function leerDatos() {
     const datos = await respuesta.json().catch(() => ({}));
     if (!respuesta.ok) throw new Error(datos.error || "HTTP " + respuesta.status);
 
+    if (datos.vivo) iniciarVivo(datos.vivo);
+
     if (!datos.ultimo) {
       conexion("Conectado", true);
-      franja("Sin registros: el ESP32 aún no ha enviado datos", "aviso");
+      if (!hayVivo()) franja("Sin registros: el ESP32 aún no ha enviado datos", "aviso");
       return;
     }
 
     ultimoDato = datos.ultimo;
-    mostrar(datos.ultimo);
     mostrarAlertas(datos.alertas || []);
-    conexion("Conectado", true);
-    actualizarFranja(datos.ultimo);
+    // Con valores en vivo recientes no se pisa la pantalla con el dato guardado (más viejo)
+    if (!hayVivo()) {
+      mostrar(datos.ultimo);
+      actualizarFranja(datos.ultimo, datos.servidor);
+    }
+    conexion(hayVivo() ? "Conectado · en vivo" : "Conectado", true);
 
   } catch (error) {
     console.error(error);
     conexion("Sin conexión con el servidor", false);
+    if (hayVivo()) return;
     if (ultimoDato) {
       franja("Datos desactualizados: se muestra la última lectura conocida", "aviso");
     } else {
@@ -54,8 +69,95 @@ async function leerDatos() {
   }
 }
 
+function hayVivo() {
+  return Date.now() - ultimoVivo < VIVO_VIGENTE;
+}
 
-function mostrar(d) {
+
+// ---------------- Canal en vivo (protocolo Phoenix de Supabase Realtime) ----------------
+let vivo = null;   // { ws, ref, timers }
+
+function iniciarVivo(cfg) {
+  if (vivo || !cfg.url || !cfg.key || typeof WebSocket === "undefined") return;
+  vivo = { ws: null, ref: 2, timers: [] };
+  conectarVivo(cfg);
+}
+
+function conectarVivo(cfg) {
+  const host = cfg.url.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  const ws = new WebSocket("wss://" + host + "/realtime/v1/websocket?apikey=" +
+                           encodeURIComponent(cfg.key) + "&vsn=1.0.0");
+  vivo.ws = ws;
+
+  const enviar = (topic, event, payload) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ topic, event, payload, ref: String(vivo.ref++), join_ref: "1" }));
+  };
+  // Avisar al ESP32 que hay alguien mirando (solo con la pestaña visible: cuida la cuota)
+  const mirando = () => {
+    if (document.visibilityState === "visible") {
+      enviar(CANAL, "broadcast", { type: "broadcast", event: "mirando", payload: {} });
+    }
+  };
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      topic: CANAL, event: "phx_join", ref: "1", join_ref: "1",
+      payload: { config: { broadcast: { self: false, ack: false }, presence: { key: "" }, private: false } }
+    }));
+    vivo.timers.push(setInterval(() => enviar("phoenix", "heartbeat", {}), LATIDO_MS));
+  };
+
+  ws.onmessage = (m) => {
+    let d;
+    try { d = JSON.parse(m.data); } catch { return; }
+    if (d.event === "phx_reply" && d.ref === "1") {
+      if (d.payload && d.payload.status === "ok") {
+        mirando();
+        vivo.timers.push(setInterval(mirando, MIRANDO_MS));
+      }
+    } else if (d.event === "broadcast" && d.payload && d.payload.event === "lectura") {
+      mostrarVivo(d.payload.payload || {});
+    }
+  };
+
+  ws.onclose = () => {
+    vivo.timers.forEach(clearInterval);
+    vivo.timers = [];
+    setTimeout(() => conectarVivo(cfg), 5000);   // reintento
+  };
+  ws.onerror = () => ws.close();
+}
+
+// Al volver a la pestaña se avisa enseguida (sin esperar 10 s)
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && vivo && vivo.ws && vivo.ws.readyState === WebSocket.OPEN) {
+    vivo.ws.send(JSON.stringify({ topic: CANAL, event: "broadcast", ref: String(vivo.ref++), join_ref: "1",
+      payload: { type: "broadcast", event: "mirando", payload: {} } }));
+  }
+});
+
+function mostrarVivo(p) {
+  // Mismo formato que un registro guardado; la hora es la de llegada (el dato tiene < 1 s)
+  const d = {
+    lectura_temperatura: p.t,
+    lectura_gas: p.g,
+    calor: !!p.calor,
+    gas: !!p.gas,
+    falla: !!p.falla,
+    sin_agua: !!p.sin_agua,
+    precalentando: !!p.precal,
+    fecha: new Date().toISOString()
+  };
+  if (!Number.isFinite(Number(d.lectura_temperatura)) || !Number.isFinite(Number(d.lectura_gas))) return;
+  ultimoVivo = Date.now();
+  mostrar(d, true);
+  actualizarFranja(d, d.fecha);
+  conexion("Conectado · en vivo", true);
+}
+
+
+function mostrar(d, enVivo = false) {
   // --- Temperatura ---
   $("temp").textContent = Number(d.lectura_temperatura).toFixed(1);
   alarma($("tarjetaTemp"), d.calor);
@@ -68,31 +170,15 @@ function mostrar(d) {
   $("estadoGas").textContent = d.precalentando ? "Precalentando sensor"
                              : d.gas ? "GAS DETECTADO - ALARMA ACTIVA" : "Sin gas";
 
-  // --- Agua y bombas ---
-  const agua = d.agua_ml == null ? null : Number(d.agua_ml);
-  const capacidad = d.capacidad_ml == null ? null : Number(d.capacidad_ml);
-  $("agua").textContent = agua == null ? "--" : agua.toFixed(0);
-  $("tarjetaAgua").classList.toggle("aviso", !d.agua_calibrada);
-
-  if (!d.agua_calibrada) {
-    // Caudal no medido: no se muestra un nivel inventado
-    $("barraAgua").style.width = "0%";
-    $("detalleAgua").textContent = "Caudal SIN CALIBRAR: control de agua desactivado. Vigilar el depósito a la vista.";
-  } else if (agua != null && capacidad) {
-    const pct = Math.max(0, Math.min(100, (agua / capacidad) * 100));
-    $("barraAgua").style.width = pct.toFixed(0) + "%";
-    $("detalleAgua").textContent = pct.toFixed(0) + "% de " + capacidad.toFixed(0) + " ml"
-      + (d.autonomia_s != null ? " · autonomía ≈ " + Number(d.autonomia_s).toFixed(0) + " s con 2 bombas" : "");
-  }
-
-  const tarjetaAgua = $("tarjetaAgua");
-  alarma(tarjetaAgua, d.sin_agua);
-  if (d.sin_agua)      $("estadoBombas").textContent = "SIN AGUA - BOMBAS BLOQUEADAS";
-  else if (d.calor)    $("estadoBombas").textContent = "BOMBAS ACTIVAS";
-  else                 $("estadoBombas").textContent = "Bombas apagadas";
+  // --- Bombas (se encienden con el calor) ---
+  const activas = d.calor && !d.sin_agua;
+  $("bombas").textContent = d.sin_agua ? "Bloqueadas" : activas ? "Activas" : "Apagadas";
+  alarma($("tarjetaBombas"), d.calor || d.sin_agua);
+  $("estadoBombas").textContent = d.sin_agua ? "SIN AGUA - BOMBAS BLOQUEADAS"
+                                : activas ? "BOMBAS ACTIVAS" : "En espera (se activan sobre 45 °C)";
 
   // --- Hora de la lectura ---
-  $("actualizado").textContent = "Última lectura: " +
+  $("actualizado").textContent = (enVivo ? "En vivo · " : "Última lectura guardada: ") +
     new Date(d.fecha).toLocaleString("es-BO", { timeZone: ZONA });
 }
 
@@ -120,22 +206,23 @@ function mostrarAlertas(alertas) {
 
 
 // Estado general del sistema (prioridad: lo más grave primero)
-function actualizarFranja(d) {
-  const antiguedad = Date.now() - new Date(d.fecha).getTime();
+function actualizarFranja(d, horaServidor) {
+  // Se compara con la hora del SERVIDOR (viene en la misma respuesta), no con el reloj
+  // del navegador: si la PC está adelantada o atrasada, el aviso saldría por error.
+  const referencia = horaServidor ? new Date(horaServidor).getTime() : Date.now();
+  const antiguedad = referencia - new Date(d.fecha).getTime();
   if (antiguedad > MAX_ANTIGUEDAD) {
     franja("ESP32 sin enviar datos recientes (sin WiFi, sin energía o apagado). La alarma local sigue funcionando si tiene energía.", "grave");
   } else if (d.sin_agua) {
-    franja("Depósito sin agua: recargar y pulsar «Reiniciar»", "grave");
+    franja("Bombas bloqueadas por falta de agua: revisar y pulsar «Reiniciar»", "grave");
   } else if (d.gas) {
     franja("GAS DETECTADO: ventilar y evacuar", "grave");
   } else if (d.falla) {
     franja("Falla de sensor: revisar conexiones del LM35 / MQ-7", "grave");
   } else if (d.calor) {
-    franja(d.agua_calibrada
-      ? "Temperatura alta: bombas activas"
-      : "Temperatura alta: bombas activas. Agua sin control: vigilar el depósito para que no trabajen en seco", "grave");
+    franja("Temperatura alta: bombas activas", "grave");
   } else if (d.precalentando) {
-    franja("Sensor de gas precalentando (60 s): la alarma de gas aún no está activa", "aviso");
+    franja("Sensor de gas precalentando: la alarma de gas aún no está activa", "aviso");
   } else {
     franja("Sistema normal", "");
   }
@@ -150,7 +237,7 @@ async function reiniciar() {
     mensaje.className = "fail";
     return;
   }
-  if (!confirm("¿El depósito ya fue recargado? El ESP32 se reiniciará y asumirá el depósito lleno.")) return;
+  if (!confirm("¿Reiniciar el ESP32? Se reinicia en unos segundos.")) return;
 
   const boton = $("botonReiniciar");
   boton.disabled = true;
@@ -192,6 +279,11 @@ function conexion(mensaje, ok) {
 }
 
 
+// Consultas a /api/estado: más espaciadas cuando el canal en vivo funciona
+async function ciclo() {
+  await leerDatos();
+  setTimeout(ciclo, hayVivo() ? INTERVALO_CON_VIVO : INTERVALO);
+}
+
 $("botonReiniciar").addEventListener("click", reiniciar);
-leerDatos();
-setInterval(leerDatos, INTERVALO);
+ciclo();

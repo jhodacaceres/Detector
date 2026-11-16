@@ -46,11 +46,12 @@ Navegador ─▶ Vercel /api (secret key oculta) ─┘   · GitHub Actions keep
 | **Fórmulas de los sensores** | Se mantienen **exactas**: `((analogReadMilliVolts(pin) * 3.3) / 4095.0)`, `× 100` para la temperatura | Decisión del proyecto. Se sabe que miden alrededor de un 20 % de menos (la conversión se aplica dos veces); los umbrales están en esa misma escala |
 | **Gas** | En **voltios**, alarma > 1.5 V (se apaga < 1.3 V) | Igual que el código original; no se usa Rs/R0 |
 | **Calor** | Bombas > 45 °C (se apagan < 43 °C) | Histéresis para que el relé no oscile |
-| **Agua** | Depósito **limitado** (500 ml de referencia, configurable). Bombas en continuo; al llegar a la reserva **se bloquean** | En un caso real la capacidad la define el usuario |
+| **Agua** | **Sin depósito fijo** (desde el 2026-11-14): la web ya no muestra el agua, solo el estado de las bombas. El firmware conserva el control de agua, **desactivado** con `CAUDAL_ML_POR_S = 0`; solo bloquearía las bombas si se vuelve a calibrar. La base no cambia (`agua_ml` queda vacío) | Ya no hay un depósito de capacidad conocida |
 | **Caudal** | **No se asume**: `CAUDAL_ML_POR_S = 0` (sin calibrar) hasta medirlo. Mientras tanto, bombas sin límite y vigilancia del depósito a la vista | No se pudo medir; un valor inventado daría un control falso |
 | **Recarga** | Llenar el depósito y luego **reiniciar** el ESP32 con el botón de la web (con PIN) o el botón EN | Al arrancar se asume el depósito lleno |
 | **Extras** | Se mantienen **todos**: token del ESP32, Telegram, botón de reinicio, retención, keepalive y respaldos | Se descartó simplificar quitando funciones |
-| **Web** | Lee mediante Vercel; las keys solo están en las variables de entorno | Un `.env` en una web estática no oculta nada (se ve con F12) |
+| **Web** | Lee mediante Vercel; la **secret key** solo está en las variables de entorno. La key **publishable** (pública por diseño) llega al navegador por `/api/estado` para el canal en vivo | Un `.env` en una web estática no oculta nada (se ve con F12) |
+| **Refresco** | **Valores en vivo cada 1 s** por Supabase Realtime Broadcast, **solo mientras alguien mira la web**. La base sigue guardando cada 5 s | Guardar 1 dato por segundo llenaría la base en ~1 mes (90 días de detalle, 500 MB, esquema congelado) y Realtime gratuito tiene 2 millones de mensajes al mes |
 | **Seguridad** | `anon` (la key pública del ESP32) **solo** ejecuta 3 RPC; no accede a ninguna tabla | Antes cualquiera podía insertar datos falsos |
 | **Retención** | 90 días de detalle → luego resumen por hora para siempre; alertas para siempre | Espacio limitado (500 MB en el plan gratuito) |
 | **Base de datos** | Normalizada (3FN, v4) con **una** desnormalización intencional: la "foto" de valores en `alertas` | Conservar la alerta aunque se borre su registro |
@@ -113,6 +114,24 @@ Navegador ─▶ Vercel /api (secret key oculta) ─┘   · GitHub Actions keep
   - `registros_resumen` gana clave propia y FK a `dispositivos`.
 - El firmware envía la configuración del depósito (`p_caudal_ml_por_s`, `p_reserva_ml`, `p_num_bombas`) y `/api/estado` calcula la autonomía.
 
+### Etapa 5: diagnóstico de hardware (2026-11-14)
+| Problema | Causa encontrada | Solución |
+|---|---|---|
+| El relé "tenía menos energía": se activaba un instante y se soltaba; el Monitor Serie mostraba caracteres raros repetidos | El ESP32 se reiniciaba al arrancar las bombas (los caracteres son su mensaje de arranque a 74880 baudios). Todo se alimentaba desde el USB de la PC, que no alcanza para las bombas | Cargador de pared de 5 V para el riel; capacitores de 470 µF (entrada de la fuente) y 100 µF (relé). Una bomba funcionaba y dos no hasta reasentar las conexiones |
+| El buzzer sonaba siempre, con `gas=0` y `falla=0` | **GPIO27 dañado**: no baja a 0 V. Se descubrió con `ESP32/buscar_pin` (con el cable en otro pin se callaba) | Buzzer movido al **GPIO32** (`PIN_BUZZER = 32`) |
+| Caracteres raros en el Monitor Serie al sonar el buzzer | Ruido eléctrico en la alimentación | Capacitores de 100 µF (buzzer) y 47 µF (LM35) |
+| El MQ-7 parecía no responder (lectura fija en 0.11) | Mal contacto del cable | Reasentado: vuelve a responder. Llegó a ~1.12 en la prueba; para pasar 1.5 se acerca más el encendedor o se concentra humo de fósforos en un vaso |
+| Un sketch de prueba pegado dentro de `detector.ino` borró el firmware | Copiar código desde el chat cortó líneas y se pegó en el archivo equivocado | Firmware restaurado. **Toda prueba va en `ESP32/buscar_pin/buscar_pin.ino`** |
+| El ESP32 no se conectaba al WiFi de la casa ("MESH HOME") | Prueba `w` de `buscar_pin`: la red se veía (WPA2, -51 dBm) pero el router respondía **motivo 15: contraseña incorrecta**. La de `secrets.h` no coincidía con la guardada en Windows | Contraseña corregida en `secrets.h` (copiada del perfil WiFi de la PC). Conecta y envía a la web |
+
+### Etapa 6: valores en vivo y web sin depósito (2026-11-14)
+- **Firmware:** tarea `tareaVivo` con WebSocket a Supabase Realtime; transmite cada 1 s solo mientras la web avisa `mirando`. Requiere la librería **WebSockets 2.7.2** (instalada). Compilado sin errores (87 % de la memoria de programa).
+- **Web:** `app.js` se une al canal, avisa `mirando` cada 10 s (solo con la pestaña visible), muestra los valores en vivo y espacia las consultas a `/api/estado` a 5 s mientras el canal funciona. Se quitó la tarjeta "Agua del depósito" (queda la tarjeta de bombas) y los textos del depósito en el botón Reiniciar.
+- **API:** `/api/estado` entrega `vivo: { url, key publishable }` si existe la variable `SUPABASE_PUBLISHABLE_KEY`.
+- **`vercel.json`:** CSP con `connect-src wss://*.supabase.co`.
+- **Verificado:** prueba de punta a punta contra el proyecto real (un cliente con el formato de la web y otro con el del firmware): unión al canal, `mirando` → `lectura` recibida.
+- `buscar_pin.ino` ahora es un menú: `w` = prueba de WiFi (lee `secrets.h` sin copiarlo), `0` = pines en LOW, número = probar ese pin.
+
 ---
 
 ## 4. Estado de la instalación
@@ -125,7 +144,7 @@ Navegador ─▶ Vercel /api (secret key oculta) ─┘   · GitHub Actions keep
 | 4 | Firmware v3 subido | ✅ Compila y guarda datos |
 | 4b | `migracion_v4.sql` y volver a subir el firmware (con el caudal sin calibrar) | ✅ v4 aplicada · ⏳ confirmar que se subió el firmware |
 | 5 | Bot de Telegram y secretos en Vault | ✅ Hecho (llegó el mensaje de prueba) |
-| 6 | Variables en Vercel (`SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `ADMIN_PIN`) y en `.env.local` | ⏳ **Siguiente paso** |
+| 6 | Variables en Vercel (`SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `ADMIN_PIN`, **`SUPABASE_PUBLISHABLE_KEY`**) y en `.env.local` | ⏳ **Siguiente paso** · `SUPABASE_PUBLISHABLE_KEY` ya está en `.env.local`; falta en Vercel |
 | 7 | `git commit` + `push` (Vercel publica solo) | ⏳ Pendiente: nada se ha subido todavía |
 | 8 | Variable `URL_APP` en GitHub y ejecutar el keepalive | ⏳ Pendiente |
 | 9 | Medir el caudal real de las bombas y ajustar `CAUDAL_ML_POR_S` y `CAPACIDAD_ML` | ⏳ Pendiente |
@@ -147,7 +166,8 @@ Detector/
 ├── .github/workflows/keepalive.yml
 ├── ESP32/
 │   ├── detector/ detector.ino · secrets.example.h · secrets.h (ignorado)
-│   └── conexiones_esp32_gas.xlsx            Tabla de 25 conexiones
+│   ├── buscar_pin/ buscar_pin.ino           Sketch para todas las pruebas de hardware
+│   └── conexiones_esp32_gas.xlsx            Tabla de 33 conexiones
 ├── supabase/
 │   ├── migracion_v2.sql   ✅ aplicada
 │   ├── migracion_v3.sql   ✅ aplicada
@@ -170,7 +190,13 @@ Detector/
 |---|---|---|
 | Caudal de las bombas **no medido** | `CAUDAL_ML_POR_S = 0`: control de agua desactivado y bombas sin límite. **Riesgo activo de que trabajen en seco** | Vigilar el depósito a la vista; medirlo (paso 9) |
 | AOUT del MQ-7 hasta 5 V en el GPIO35 (que admite 3.3 V) | Riesgo de dañar el pin | Medir con multímetro; divisor 10k/20k y `FACTOR_DIVISOR_MQ7 = 1.5` |
-| Bombas sin diodo flyback ni capacitor | Posibles reinicios por caída de tensión | Diodo 1N4007 por bomba y capacitor de 470–1000 µF |
+| **Ruido del LM35** (la lectura salta entre 24 y 35 °C; picos de 49–56 °C generaron alertas de calor falsas el 2026-11-13) | Activa bombas y alertas sin calor real. Se decidió **no** filtrar por software por ahora | Puesto el 47 µF en la alimentación del LM35 (2026-11-14). Falta: cerámico de 100 nF (104) entre OUT y GND; alejarlo de los relés y las bombas |
+| Tarea de red trabada en silencio (2026-11-13, 20 min sin guardar datos; se repitió a las 16:20) | Causa probable: reutilización de la conexión TLS. Corregido: conexión nueva en cada envío, más el vigilante de red (reconexión a los 60 s, reinicio a los 180 s) | Confirmar que `[Red] OK · hace 1–6 s` se mantiene durante 30 min o más |
+| Reloj del ESP32 unos 54 s atrasado | Las lecturas recientes ahora usan la hora de Supabase | — |
+| **GPIO27 dañado** (2026-11-14: no baja a 0 V y el buzzer sonaba siempre). El buzzer se movió al **GPIO32** | Otro pin podría dañarse igual por los picos de las bombas | No usar el GPIO27; diodos y capacitor en las bombas |
+| Bombas sin diodo flyback: **riesgo aceptado** (2026-11-14, no se dispone de diodos). Los capacitores ya están puestos | Los picos al apagarlas pueden dañar otros pines (probable causa del GPIO27) y los contactos del relé | Si el buzzer o un relé se comportan raro, diagnosticar el pin con `ESP32/buscar_pin` y moverlo a uno libre (33). Poner diodos si se consiguen |
+| Canal en vivo público (Realtime) | Con la key publishable se pueden mostrar valores falsos en la pantalla en vivo o gastar la cuota con `mirando` falsos. La base y las alertas no se ven afectadas | Aceptado (los canales privados requieren cambiar la base). Revisar el uso de Realtime en Supabase → Usage |
+| Cuota Realtime del plan gratuito (2 millones de mensajes al mes) | ≈ 2 mensajes por segundo con la web abierta: alcanza para ≈ 270 h de pantalla abierta al mes | Cerrar la web cuando no se use; si hace falta, `VIVO_MS = 2000` en el firmware |
 | Relé que se apaga con `INPUT` | Sin probar en todos los módulos | Si se enciende, `APAGAR_RELE_CON_INPUT = false` |
 | `fecha_bolivia` | Depende de que Postgres aceptara la columna generada | Revisar que exista en Table Editor |
 | `migracion_v4.sql` y firmware v4 | No se han ejecutado ni compilado | Paso 4b |
